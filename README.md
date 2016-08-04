@@ -1,5 +1,7 @@
 # Shibboleth-IdP-Throttling-patch
 
+## This patch adds throttling for both usernames and IP addresses ##
+
 ## Install ##
 
 # Download the source code
