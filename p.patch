@@ -1,0 +1,376 @@
+diff -cr --new-file 3.2.1/idp-authn-api/src/main/java/net/shibboleth/idp/authn/AbstractUsernamePasswordValidationAction.java 3.2.1-LoginThrottle/idp-authn-api/src/main/java/net/shibboleth/idp/authn/AbstractUsernamePasswordValidationAction.java
+*** 3.2.1/idp-authn-api/src/main/java/net/shibboleth/idp/authn/AbstractUsernamePasswordValidationAction.java	2016-08-04 23:32:38.844337100 +0200
+--- 3.2.1-LoginThrottle/idp-authn-api/src/main/java/net/shibboleth/idp/authn/AbstractUsernamePasswordValidationAction.java	2016-08-04 23:32:28.163509627 +0200
+***************
+*** 27,32 ****
+--- 27,34 ----
+  import net.shibboleth.idp.authn.principal.UsernamePrincipal;
+  import net.shibboleth.utilities.java.support.component.ComponentSupport;
+  
++ import net.shibboleth.idp.authn.LoginThrottle;
++ 
+  import org.opensaml.profile.context.ProfileRequestContext;
+  import org.slf4j.Logger;
+  import org.slf4j.LoggerFactory;
+***************
+*** 108,115 ****
+              handleError(profileRequestContext, authenticationContext, "InvalidCredentials",
+                      AuthnEventIds.INVALID_CREDENTIALS);
+              return false;
+          }
+-         
+          return true;
+      }
+  
+--- 110,126 ----
+              handleError(profileRequestContext, authenticationContext, "InvalidCredentials",
+                      AuthnEventIds.INVALID_CREDENTIALS);
+              return false;
++ 	} else if (!LoginThrottle.validateIP(upContext.getIPAddress())) { // Validate IPAddress throttle                                                                                  
++             log.info("{} User '{}' failed IP address throttling check - IP adress: '{}'", getLogPrefix(), upContext.getUsername(), upContext.getIPAddress());
++             handleError(profileRequestContext, authenticationContext, "ThrottledIPAddress",
++                         AuthnEventIds.INVALID_CREDENTIALS);
++             return false;
++         } else if (!LoginThrottle.validateUsername(upContext.getUsername())) { // Validate username throttle                                                                              
++             log.info("{} User '{}' failed username throttling check - IP adress: '{}'", getLogPrefix(), upContext.getUsername(), upContext.getIPAddress());
++             handleError(profileRequestContext, authenticationContext, "ThrottledUsername",
++                         AuthnEventIds.INVALID_CREDENTIALS);
++             return false;
+          }
+          return true;
+      }
+  
+***************
+*** 123,126 ****
+          return subject;
+      }
+      
+! }
+\ No newline at end of file
+--- 134,137 ----
+          return subject;
+      }
+      
+! }
+diff -cr --new-file 3.2.1/idp-authn-api/src/main/java/net/shibboleth/idp/authn/context/UsernamePasswordContext.java 3.2.1-LoginThrottle/idp-authn-api/src/main/java/net/shibboleth/idp/authn/context/UsernamePasswordContext.java
+*** 3.2.1/idp-authn-api/src/main/java/net/shibboleth/idp/authn/context/UsernamePasswordContext.java	2016-08-04 23:32:38.940335549 +0200
+--- 3.2.1-LoginThrottle/idp-authn-api/src/main/java/net/shibboleth/idp/authn/context/UsernamePasswordContext.java	2016-08-04 23:32:28.164509611 +0200
+***************
+*** 34,39 ****
+--- 34,42 ----
+      /** The password associated with the username. */
+      private String password;
+  
++     /** The IP adress of the client */
++     private String IPAddress;
++ 
+      /**
+       * Gets the username.
+       * 
+***************
+*** 65,71 ****
+      }
+  
+      /**
+!      * Sets the password associated with the username.
+       * 
+       * @param pass password associated with the username
+       * 
+--- 68,74 ----
+      }
+  
+      /**
+!      * Sets the IP address
+       * 
+       * @param pass password associated with the username
+       * 
+***************
+*** 75,79 ****
+          password = pass;
+          return this;
+      }
+      
+! }
+\ No newline at end of file
+--- 78,91 ----
+          password = pass;
+          return this;
+      }
++ 
++     @Nullable public String getIPAddress() {
++         return IPAddress;
++     }
++     
++     public UsernamePasswordContext setIPAddress(@Nullable final String ip) {
++         IPAddress = ip;
++ 	return this;
++     }
+      
+! }
+diff -cr --new-file 3.2.1/idp-authn-api/src/main/java/net/shibboleth/idp/authn/LoginThrottle.java 3.2.1-LoginThrottle/idp-authn-api/src/main/java/net/shibboleth/idp/authn/LoginThrottle.java
+*** 3.2.1/idp-authn-api/src/main/java/net/shibboleth/idp/authn/LoginThrottle.java	1970-01-01 01:00:00.000000000 +0100
+--- 3.2.1-LoginThrottle/idp-authn-api/src/main/java/net/shibboleth/idp/authn/LoginThrottle.java	2016-08-04 23:32:28.164509611 +0200
+***************
+*** 0 ****
+--- 1,182 ----
++ package net.shibboleth.idp.authn;
++ 
++ import java.util.concurrent.locks.ReentrantLock;
++ import java.util.ArrayList;
++ import java.util.Set;
++ import java.util.Iterator;
++ import java.util.concurrent.ConcurrentHashMap;
++ import java.util.HashSet;
++ 
++ /** 
++  * SMHI 2015-11-10 Victor Näslund <victor.naslund@smhi.se>
++  * Keep a hashmap in memory storing number of user attempts and time to throttle any brutefoce attempts
++  * Use a lock to ensure integrity of our map during map operations
++  */
++ 
++ public final class LoginThrottle {
++     private static ConcurrentHashMap<String, ArrayList<String>> usernames = new ConcurrentHashMap<String, ArrayList<String>>(8192); // Set this to 8192 so no need to rezise until a bruteforce attack happens
++     private static ConcurrentHashMap<String, ArrayList<String>> IPAddresses = new ConcurrentHashMap<String, ArrayList<String>>(8192); // Set this to 8192 so no need to rezise until a bruteforce attack happens
++     private static final ReentrantLock lock = new ReentrantLock(); // We need a lock to ensure integrity of our map during map operations
++     private static final int THROTTLETIME = 1200; // Throttle time in seconds 1200 = 20 minutes
++     private static int SLOWDOWN = 0; // Simple wait in milliseconds for each loginattempt, this goes up during an bruteforce attack to ensure we do not run out of memory since we clear old users
++ 
++     // ---- During a bruteforce attempt ----
++     // 293 attempts per 20 minutes but if we hit the throttle count which is 4 we get 74 tried usernames per 20 minutes
++     // This means for each host in his botnet, an attacker can try 293 attempts per 20 minutes
++ 
++     // Each entry in our map is 3 strings and each string is about the strings chars * 2 bytes in memory
++     // This means eatch entry is about 
++     // a002029.length() == 7 
++     // 7 * 2 + time is 13 chars so we get
++     // 7 * 2 + 13 * 2 = 40 but say 50 bytes in memory
++ 
++     // An attackers botnet would have to require  
++     // 2147483648 (2GB) / (50 * 293) = 146 586 number of hosts
++ 
++ 
++     private static void updateSlowdown() { // We increase the slowdown time the larger our map is, meaning during an bruteforce attack
++ 	if (usernames.size() > 8000) { // SMHI only have 650 employees so this only happens during a bruteforce attack
++ 	    SLOWDOWN = 4096; // 4.096 seconds
++ 	}
++ 	else if (usernames.size() > 6000) {    
++ 	    SLOWDOWN = 3076;
++ 	}
++ 	else if (usernames.size() > 3000) {
++ 	    SLOWDOWN = 2048;
++ 	}
++ 	else if (usernames.size() > 1000) {
++ 	    SLOWDOWN = 1024;
++ 	}
++ 	else if (usernames.size() > 100) {
++ 	    SLOWDOWN = 256;
++ 	}
++ 	else {
++ 	    SLOWDOWN = 0;
++ 	}
++     }
++     
++     private static void clearOld() { // Remove old users, users that have been locked for more than 20 minutes from our map
++ 	Iterator<String> iteratorUsernames = usernames.keySet().iterator();
++ 	Iterator<String> iteratorIPAddresses = IPAddresses.keySet().iterator();
++ 
++ 	while  (iteratorUsernames.hasNext()) { // For all entries in our map
++ 	    ArrayList<String> list = usernames.get(iteratorUsernames.next());
++ 	    if (Long.parseLong(list.get(1)) + THROTTLETIME < (System.currentTimeMillis() / 1000)) { // If user is old and should be removed
++ 		iteratorUsernames.remove(); // Remove the entry
++ 	    }
++ 	}
++ 
++ 	while  (iteratorIPAddresses.hasNext()) { // For all entries in our map
++ 	    ArrayList<String> list = IPAddresses.get(iteratorIPAddresses.next());
++ 	    if (Long.parseLong(list.get(1)) + THROTTLETIME < (System.currentTimeMillis() / 1000)) { // If ip is old and should be removed
++ 		iteratorIPAddresses.remove(); // Remove the entry
++ 	    }
++ 	}
++     }
++ 
++     private static void updateUsernames(final String username, final int count, final long time) // Update our maps 
++     { // lock is not needed, functions calling this function should take care of locking
++ 	ArrayList<String> list = new ArrayList<String>();
++ 
++ 	list.add(new String(Integer.toString(count)));
++ 	list.add(new String(Long.toString(time)));
++ 	usernames.put(username, list);
++     }
++ 
++     private static void updateIPAddresses(final String ip, final int count, final long time) // Update our maps 
++     { // lock is not needed, functions calling this function should take care of locking
++ 	ArrayList<String> list = new ArrayList<String>();
++ 	
++ 	list.add(new String(Integer.toString(count)));
++ 	list.add(new String(Long.toString(time)));
++ 	IPAddresses.put(ip, list);
++     }
++ 
++     public static void clearUsernameAndIP(final String username, final String ip) { // User passed a loginattempt so we clear the user from our map
++ 	lock.lock(); // Wait for other threads to modify our maps, then make other threads wait for us to finish
++ 	try {
++ 	    usernames.remove(username);
++ 	    IPAddresses.remove(ip);
++ 	} finally {
++ 	    lock.unlock(); // We are done with modifying our map so we can release the lock
++ 	}
++     }
++ 
++     public static boolean validateUsername(final String username) {// Look into our map and se if user should be allow to attempt to login or not
++ 	boolean retVal = true;
++ 
++ 	try { // Sleep SLOWDOWN millisecond to prevent bruteforcing, Before the lock so we wont lock out legitimate users during a bruteforce attack
++ 	    Thread.sleep(SLOWDOWN/2);
++ 	} catch (InterruptedException e) {
++ 	    return false;
++ 	}
++ 
++ 	lock.lock(); // Wait for other threads to modify our maps, then make other threads wait for us to finish
++ 	try {
++ 	    if (usernames.containsKey(username)) { // If user is in our map mean they failed a loginattempt in the past
++ 		// They will be removed from our map once they pass a login attempt
++ 		if (Integer.parseInt(usernames.get(username).get(0)) > 3) { // If they failed 4 times i a row or more
++ 		    if (Long.parseLong(usernames.get(username).get(1)) + THROTTLETIME >  (System.currentTimeMillis() / 1000)) {
++ 			updateUsernames(username, Integer.parseInt(usernames.get(username).get(0)), System.currentTimeMillis() / 1000);
++ 			retVal = false; // User is still locked out, only return false here all other conditions should we return true
++ 		    }
++ 		    else { // THROTTLE TIME seconds have now passed and user is again allowed, we set the users counter to 1
++ 			updateUsernames(username, 1, System.currentTimeMillis() / 1000);
++ 		    }
++ 		}
++ 		else { // user have not failed more 4 or more times in a row so we allow them and increase counter for that user
++ 		    updateUsernames(username, Integer.parseInt(usernames.get(username).get(0)) + 1, System.currentTimeMillis() / 1000);
++ 		}
++ 	    }
++ 	    else { // User was not in our map so we allow and set counter to 1 for that user
++ 		updateUsernames(username, 1, System.currentTimeMillis() / 1000);
++ 	    }
++ 	    return retVal;
++ 	} finally {
++ 	    clearOld(); // This means that when a login attempt is in process, we clear old users who last tried over THROTTLE TIME ago,
++ 	    //  this will make sure we dont run out of memory
++ 	    updateSlowdown(); // If out map now is large enough for us to update slowdown time
++ 	    lock.unlock(); // We are done with modifying our map so we can release the lock
++ 	}
++     }
++     public static boolean validateIP(final String ip) { // Look into our map and se if user should be allow to attempt to login or not
++ 	// If this is false then we deny the user and not bother validating the credentials
++ 	// We will still allow certificate login if the user is locked out, that is good
++ 	boolean retVal = true;
++ 
++ 	try { // Sleep SLOWDOWN millisecond to prevent bruteforcing, Before the lock so we wont lock out legitimate users during a bruteforce attack
++ 	    Thread.sleep(SLOWDOWN/2); // Divided by 2 since we run this nce for usersnames and once for ip addresses
++ 	} catch (InterruptedException e) {
++ 	    return false;
++ 	}
++ 
++ 	lock.lock(); // Wait for other threads to modify our maps, then make other threads wait for us to finish
++ 	try {
++ 	    if (IPAddresses.containsKey(ip)) { // If ip is in our map mean they failed a loginattempt in the past
++ 		// They will be removed from our map once they pass a login attempt
++ 		if (Integer.parseInt(IPAddresses.get(ip).get(0)) > 3) { // If they failed 4 times i a row or more
++ 		    if (Long.parseLong(IPAddresses.get(ip).get(1)) + THROTTLETIME >  (System.currentTimeMillis() / 1000)) {
++ 			updateIPAddresses(ip, Integer.parseInt(IPAddresses.get(ip).get(0)), System.currentTimeMillis() / 1000);
++ 			retVal = false; // IP is still locked out, only return false here all other conditions should we return true
++ 		    }
++ 		    else { // THROTTLE TIME seconds have now passed and ip is again allowed, we set the users counter to 1
++ 			updateIPAddresses(ip, 1, System.currentTimeMillis() / 1000);
++ 		    }
++ 		}
++ 		else { // ip have not failed more 4 or more times in a row so we allow them and increase counter for that ip
++ 		    updateIPAddresses(ip, Integer.parseInt(IPAddresses.get(ip).get(0)) + 1, System.currentTimeMillis() / 1000);
++ 		}
++ 	    }
++ 	    else { // ip was not in our map so we allow and set counter to 1 for that ip
++ 		updateIPAddresses(ip, 1, System.currentTimeMillis() / 1000);
++ 	    }
++ 	    return retVal;
++ 	} finally {
++ 	    clearOld(); // This means that when a login attempt is in process, we clear old users who last tried over THROTTLE TIME ago,
++ 	    //  this will make sure we dont run out of memory
++ 	    updateSlowdown(); // If out map now is large enough for us to update slowdown time
++ 	    lock.unlock(); // We are done with modifying our map so we can release the lock
++ 	}
++     }
++ }
++ 
+diff -cr --new-file 3.2.1/idp-authn-impl/src/main/java/net/shibboleth/idp/authn/impl/ExtractUsernamePasswordFromFormRequest.java 3.2.1-LoginThrottle/idp-authn-impl/src/main/java/net/shibboleth/idp/authn/impl/ExtractUsernamePasswordFromFormRequest.java
+*** 3.2.1/idp-authn-impl/src/main/java/net/shibboleth/idp/authn/impl/ExtractUsernamePasswordFromFormRequest.java	2016-08-04 23:32:43.082268644 +0200
+--- 3.2.1-LoginThrottle/idp-authn-impl/src/main/java/net/shibboleth/idp/authn/impl/ExtractUsernamePasswordFromFormRequest.java	2016-08-04 23:32:28.144509934 +0200
+***************
+*** 134,144 ****
+          }
+  
+          upCtx.setPassword(password);
+!         
+          final String donotcache = request.getParameter(ssoBypassFieldName);
+          if (donotcache != null && "1".equals(donotcache)) {
+              log.debug("{} Recording do-not-cache instruction in authentication context", getLogPrefix());
+              authenticationContext.setResultCacheable(false);
+          }
+      }
+! }
+\ No newline at end of file
+--- 134,153 ----
+          }
+  
+          upCtx.setPassword(password);
+!  
+! 	final String IPAddress = request.getRemoteAddr(); // Get client IP                                                                                                                    
+!         if (IPAddress == null || IPAddress.isEmpty()) {
+!             log.debug("{} No IPAddress in request", getLogPrefix());
+!             ActionSupport.buildEvent(profileRequestContext, AuthnEventIds.NO_CREDENTIALS);
+!             return;
+!         }
+! 
+!         upCtx.setIPAddress(IPAddress);
+!        
+          final String donotcache = request.getParameter(ssoBypassFieldName);
+          if (donotcache != null && "1".equals(donotcache)) {
+              log.debug("{} Recording do-not-cache instruction in authentication context", getLogPrefix());
+              authenticationContext.setResultCacheable(false);
+          }
+      }
+! }
+diff -cr --new-file 3.2.1/idp-conf/src/main/resources/conf/authn/password-authn-config.xml 3.2.1-LoginThrottle/idp-conf/src/main/resources/conf/authn/password-authn-config.xml
+*** 3.2.1/idp-conf/src/main/resources/conf/authn/password-authn-config.xml	2016-08-04 23:32:38.102349085 +0200
+--- 3.2.1-LoginThrottle/idp-conf/src/main/resources/conf/authn/password-authn-config.xml	2016-08-04 23:32:28.157509724 +0200
+***************
+*** 75,80 ****
+--- 75,90 ----
+                  <value>ACCOUNT_WARNING</value>
+              </list>
+          </entry>
++         <entry key="ThrottledUsername">
++             <list>
++                 <value>ThrottledUsername</value>
++             </list>
++         </entry>
++         <entry key="ThrottledIPAddress">
++             <list>
++                 <value>ThrottledIPAddress</value>
++             </list>
++ 	</entry>
+      </util:map>
+  
+      <!--
+diff -cr --new-file 3.2.1/idp-conf/src/main/resources/messages/authn-messages.properties 3.2.1-LoginThrottle/idp-conf/src/main/resources/messages/authn-messages.properties
+*** 3.2.1/idp-conf/src/main/resources/messages/authn-messages.properties	2016-08-04 23:32:38.174347922 +0200
+--- 3.2.1-LoginThrottle/idp-conf/src/main/resources/messages/authn-messages.properties	2016-08-04 23:32:28.158509707 +0200
+***************
+*** 49,54 ****
+--- 49,60 ----
+  SPNEGONotAvailable = spnego-unavailable
+  NTLMUnsupported = ntlm
+  
++ # Throttling
++ ThrottledUsername = throttled-username
++ ThrottledIPAddress = throttled-ipaddress
++ throttled-username.message = Your account is locked for 20 minutes.
++ throttled-ipaddress.message = Your IP address is locked for 20 minutes.
++ 
+  bad-username.message = The username you entered cannot be identified.
+  
+  bad-password.message = The password you entered was incorrect.
+Binary files 3.2.1/.svn/wc.db and 3.2.1-LoginThrottle/.svn/wc.db differ
