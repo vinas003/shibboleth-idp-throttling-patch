@@ -1,6 +1,6 @@
 # Shibboleth-IdP-Throttling-patch
 
-## This patch adds throttling for both usernames and IP addresses ##
+This patch adds throttling for both usernames and IP addresses
 
 ## Install ##
 
@@ -8,7 +8,7 @@
 svn co https://svn.shibboleth.net/java-identity-provider/tags/3.2.1/ 3.2.1
 
 # Patch it
-patch -p0 -i ../p.patch
+patch -p0 -i p.patch
 
 # Build
 cd 3.2.1/idp-parent && mvn -DskipTests clean install
